@@ -174,7 +174,8 @@ function yazfiMergeIntoOriginData()
             obj.ip6 = "";
             obj.ip6_prefix = "";
             obj.name = guest.name ? String(guest.name) : mac;
-            obj.nickName = "";
+            /* Custom names arrive in nickName; leave it empty when the client has none. */
+            obj.nickName = guest.nickName ? String(guest.nickName) : "";
             obj.isOnline = "1";
             obj.isWL = String(guest.isWL || "1");
             obj.isGN = String(guest.isGN || "1");
