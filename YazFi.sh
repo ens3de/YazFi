@@ -45,7 +45,7 @@ readonly YAZFI_VERSION="v4.4.12"
 readonly SCRIPT_VERSION="v4.4.12"
 readonly SCRIPT_VERSTAG="26080922"
 SCRIPT_BRANCH="master"
-SCRIPT_REPO="https://raw.githubusercontent.com/AMTM-OSR/$SCRIPT_NAME/$SCRIPT_BRANCH"
+SCRIPT_REPO="https://raw.githubusercontent.com/ens3de/$SCRIPT_NAME/$SCRIPT_BRANCH"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
 readonly USER_SCRIPT_DIR="$SCRIPT_DIR/userscripts.d"
 readonly SCRIPT_WEBPAGE_DIR="$(readlink -f /www/user)"
@@ -1871,9 +1871,86 @@ NetworkMap_Config_Enabled()
 	esac
 }
 
+# ens3de fork: custom_clientlist entries are "<name>MAC>flag>type>>" (name is field 1).
+# awk -F '>' '{print $(NF-1)}' is empty on that record (thanks Adamm00 for the original lookup).
+CustomClientList_Name()
+{
+	[ -n "$1" ] || return 0
+	[ -n "$2" ] || return 0
+	# RS is a character that does not appear in nvram, so a name may contain newlines.
+	printf '%s\n' "$1" | awk -v mac="$2" '
+		BEGIN { RS = "\036"; name = "" }
+		{
+			n = split($0, entries, "<")
+			for (i = 1; i <= n; i++) {
+				if (entries[i] == "")
+					continue
+				nf = split(entries[i], fields, ">")
+				if (nf < 2 || fields[1] == "")
+					continue
+				entrymac = fields[2]
+				gsub(/[\r\n]/, "", entrymac)
+				if (tolower(entrymac) == tolower(mac))
+					name = fields[1]
+			}
+		}
+		END {
+			if (name != "")
+				print name
+		}
+	'
+}
+
 NetworkMap_JSON_Escape()
 {
-	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+	# Escape a JSON string. Hostname sanitization stays separate; custom names use this path.
+	printf '%s' "$1" | awk '
+		BEGIN { ORS = "" }
+		{
+			if (NR > 1)
+				printf "\\n"
+			out = ""
+			for (i = 1; i <= length($0); i++) {
+				c = substr($0, i, 1)
+				if (c == "\\")
+					out = out "\\\\"
+				else if (c == "\"")
+					out = out "\\\""
+				else if (c == "\t")
+					out = out "\\t"
+				else if (c == "\r")
+					out = out "\\r"
+				else if (c ~ /[[:cntrl:]]/)
+					continue
+				else
+					out = out c
+			}
+			printf "%s", out
+		}
+	'
+}
+
+# Print the JSON-escaped display name, then nickName.
+# A non-empty custom_clientlist name wins. Otherwise: DHCP hostname, else MAC.
+NetworkMap_Resolve_Client()
+{
+	local CUSTOM_NAME NAME NICK
+	CUSTOM_NAME="$(CustomClientList_Name "$1" "$2")"
+	if [ -n "$CUSTOM_NAME" ]
+	then
+		NAME="$CUSTOM_NAME"
+		NICK="$CUSTOM_NAME"
+	else
+		NAME="$3"
+		if [ -z "$NAME" ] || [ "$NAME" = "*" ]
+		then
+			NAME="$2"
+		fi
+		NAME="$(printf '%s' "$NAME" | sed 's/[^A-Za-z0-9._ -]/_/g')"
+		NICK=""
+	fi
+	printf '%s\n' "$(NetworkMap_JSON_Escape "$NAME")"
+	printf '%s\n' "$(NetworkMap_JSON_Escape "$NICK")"
 }
 
 ##----------------------------------------##
@@ -1884,8 +1961,9 @@ NetworkMap_Generate_JSON()
 	local TMPJSON FIRST IFACE IFACETAG IFADDR RADIO GUEST_INDEX ISWL
 	local MAC IP LEASE LEASE_IP NAME RSSI
 	local STAINFO CURTX CURRX CONNECTED WLCONNECTTIME
-	local MAC_UPPER JMAC JIP JNAME JIFACE
+	local MAC_UPPER JMAC JIP JNAME JNICK JIFACE
 	local JCURTX JCURRX JWLCONNECTTIME
+	local CUSTOM_CLIENTLIST RESOLVED
 
 	mkdir -p "$SCRIPT_WEB_DIR" || return 1
 	TMPJSON="${NETWORKMAP_JSON}.$$"
@@ -1895,6 +1973,7 @@ NetworkMap_Generate_JSON()
 	if [ -s "$SCRIPT_CONF" ]
 	then
 		. "$SCRIPT_CONF"
+		CUSTOM_CLIENTLIST="$(nvram get custom_clientlist 2>/dev/null)"
 		for IFACE in $IFACELIST_ORIG
 		do
 			IFACETAG="$(Get_Iface_Var "$IFACE")"
@@ -1936,10 +2015,9 @@ NetworkMap_Generate_JSON()
 				fi
 				[ -z "$IP" ] && continue
 
-				if [ -z "$NAME" ] || [ "$NAME" = "*" ]
-				then NAME="$MAC"
-				fi
-				NAME="$(printf '%s' "$NAME" | sed 's/[^A-Za-z0-9._ -]/_/g')"
+				RESOLVED="$(NetworkMap_Resolve_Client "$CUSTOM_CLIENTLIST" "$MAC" "$NAME")"
+				JNAME="$(printf '%s\n' "$RESOLVED" | awk 'NR == 1 { print; exit }')"
+				JNICK="$(printf '%s\n' "$RESOLVED" | awk 'NR == 2 { print; exit }')"
 
 				RSSI="$(wl -i "$IFACE" rssi "$MAC" 2>/dev/null | awk 'NR == 1 { print $1 }')"
 				case "$RSSI" in
@@ -1985,7 +2063,6 @@ NetworkMap_Generate_JSON()
 				MAC_UPPER="$(printf '%s' "$MAC" | tr '[:lower:]' '[:upper:]')"
 				JMAC="$(NetworkMap_JSON_Escape "$MAC_UPPER")"
 				JIP="$(NetworkMap_JSON_Escape "$IP")"
-				JNAME="$(NetworkMap_JSON_Escape "$NAME")"
 				JIFACE="$(NetworkMap_JSON_Escape "$IFACE")"
 				JCURTX="$(NetworkMap_JSON_Escape "$CURTX")"
 				JCURRX="$(NetworkMap_JSON_Escape "$CURRX")"
@@ -1993,10 +2070,11 @@ NetworkMap_Generate_JSON()
 
 				[ "$FIRST" -eq 1 ] || printf ',' >> "$TMPJSON"
 				FIRST=0
-				printf '{"mac":"%s","ip":"%s","name":"%s","isWL":"%s","isGN":"%s","rssi":"%s","iface":"%s","curTx":"%s","curRx":"%s","wlConnectTime":"%s"}' \
+				printf '{"mac":"%s","ip":"%s","name":"%s","nickName":"%s","isWL":"%s","isGN":"%s","rssi":"%s","iface":"%s","curTx":"%s","curRx":"%s","wlConnectTime":"%s"}' \
 					"$JMAC" \
 					"$JIP" \
 					"$JNAME" \
+					"$JNICK" \
 					"$ISWL" \
 					"$GUEST_INDEX" \
 					"$RSSI" \
@@ -4239,7 +4317,7 @@ Menu_Status()
 						if [ "$GUEST_HOST" = "*" ] || [ "$GUEST_HOST" = "?" ] || \
 						   [ "$(printf "%s" "$GUEST_HOST" | wc -m)" -le 1 ]
 						then
-							GUEST_HOST="$(nvram get custom_clientlist | grep -ioE "<.*>$GUEST_MACADDR" | awk -F ">" '{print $(NF-1)}' | tr -d '<')" #thanks Adamm00
+							GUEST_HOST="$(CustomClientList_Name "$(nvram get custom_clientlist)" "$GUEST_MACADDR")" #thanks Adamm00
 						fi
 
 						if [ -z "$GUEST_HOST" ] && [ -x /opt/bin/dig ]
@@ -4258,7 +4336,7 @@ Menu_Status()
 						if [ "$GUEST_HOST" = "*" ] || [ "$GUEST_HOST" = "?" ] || \
 						   [ "$(printf "%s" "$GUEST_HOST" | wc -m)" -le 1 ]
 						then
-							GUEST_HOST="$(nvram get custom_clientlist | grep -ioE "<.*>$GUEST_MACADDR" | awk -F ">" '{print $(NF-1)}' | tr -d '<')" #thanks Adamm00
+							GUEST_HOST="$(CustomClientList_Name "$(nvram get custom_clientlist)" "$GUEST_MACADDR")" #thanks Adamm00
 						fi
 					else
 						GUEST_IPADDR="Unknown"
@@ -4816,13 +4894,13 @@ case "$1" in
 	;;
 	develop)
 		SCRIPT_BRANCH="develop"
-		SCRIPT_REPO="https://raw.githubusercontent.com/AMTM-OSR/$SCRIPT_NAME/$SCRIPT_BRANCH"
+		SCRIPT_REPO="https://raw.githubusercontent.com/ens3de/$SCRIPT_NAME/$SCRIPT_BRANCH"
 		Update_Version force
 		exit 0
 	;;
 	stable)
 		SCRIPT_BRANCH="master"
-		SCRIPT_REPO="https://raw.githubusercontent.com/AMTM-OSR/$SCRIPT_NAME/$SCRIPT_BRANCH"
+		SCRIPT_REPO="https://raw.githubusercontent.com/ens3de/$SCRIPT_NAME/$SCRIPT_BRANCH"
 		Update_Version force
 		exit 0
 	;;
