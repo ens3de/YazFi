@@ -1903,7 +1903,8 @@ CustomClientList_Name()
 
 NetworkMap_JSON_Escape()
 {
-	# Escape a JSON string. Hostname sanitization stays separate; custom names use this path.
+	# Escape a JSON string. Hostname sanitization stays separate; custom names and SSIDs use this path.
+	# < > & become \u escapes so a SSID cannot break JSON or HTML if the payload is inlined.
 	printf '%s' "$1" | awk '
 		BEGIN { ORS = "" }
 		{
@@ -1920,6 +1921,12 @@ NetworkMap_JSON_Escape()
 					out = out "\\t"
 				else if (c == "\r")
 					out = out "\\r"
+				else if (c == "<")
+					out = out "\\u003c"
+				else if (c == ">")
+					out = out "\\u003e"
+				else if (c == "&")
+					out = out "\\u0026"
 				else if (c ~ /[[:cntrl:]]/)
 					continue
 				else
@@ -1928,6 +1935,25 @@ NetworkMap_JSON_Escape()
 			printf "%s", out
 		}
 	'
+}
+
+# One JSON object: {"ssidMap":{"wl0":"...","wl0.1":"..."}}.
+# Reads only *_ssid. Never reads psk, wep, radius, or key nvram.
+NetworkMap_Write_SSID_Map()
+{
+	local IFACE SSID JIFACE JSSID SEP
+	SEP=""
+	printf '{"ssidMap":{'
+	for IFACE in wl0 wl1 wl2 wl3 $IFACELIST_FULL
+	do
+		SSID="$(nvram get "${IFACE}_ssid" 2>/dev/null)" || SSID=""
+		[ -n "$SSID" ] || continue
+		JIFACE="$(NetworkMap_JSON_Escape "$IFACE")"
+		JSSID="$(NetworkMap_JSON_Escape "$SSID")"
+		printf '%s"%s":"%s"' "$SEP" "$JIFACE" "$JSSID"
+		SEP=","
+	done
+	printf '}}'
 }
 
 # Print the JSON-escaped display name, then nickName.
@@ -1961,14 +1987,15 @@ NetworkMap_Generate_JSON()
 	local TMPJSON FIRST IFACE IFACETAG IFADDR RADIO GUEST_INDEX ISWL
 	local MAC IP LEASE LEASE_IP NAME RSSI
 	local STAINFO CURTX CURRX CONNECTED WLCONNECTTIME
-	local MAC_UPPER JMAC JIP JNAME JNICK JIFACE
+	local MAC_UPPER JMAC JIP JNAME JNICK JIFACE JSSID SSID
 	local JCURTX JCURRX JWLCONNECTTIME
-	local CUSTOM_CLIENTLIST RESOLVED
+	local CUSTOM_CLIENTLIST RESOLVED SSID_MAP_JSON
 
 	mkdir -p "$SCRIPT_WEB_DIR" || return 1
 	TMPJSON="${NETWORKMAP_JSON}.$$"
-	printf '[' > "$TMPJSON" || return 1
-	FIRST=1
+	SSID_MAP_JSON="$(NetworkMap_Write_SSID_Map)" || SSID_MAP_JSON='{"ssidMap":{}}'
+	printf '[%s' "$SSID_MAP_JSON" > "$TMPJSON" || return 1
+	FIRST=0
 
 	if [ -s "$SCRIPT_CONF" ]
 	then
@@ -1988,6 +2015,9 @@ NetworkMap_Generate_JSON()
 			case "$RADIO" in ''|*[!0-9]*) continue ;; esac
 			case "$GUEST_INDEX" in ''|*[!0-9]*) GUEST_INDEX=1 ;; esac
 			ISWL="$((RADIO + 1))"
+			# SSID only — do not read ${IFACE}_wpa_psk or any other wireless secret.
+			SSID="$(nvram get "${IFACE}_ssid" 2>/dev/null)" || SSID=""
+			JSSID="$(NetworkMap_JSON_Escape "$SSID")"
 
 			for MAC in $(wl -i "$IFACE" assoclist 2>/dev/null | awk -F' ' '{print $2}')
 			do
@@ -2070,7 +2100,7 @@ NetworkMap_Generate_JSON()
 
 				[ "$FIRST" -eq 1 ] || printf ',' >> "$TMPJSON"
 				FIRST=0
-				printf '{"mac":"%s","ip":"%s","name":"%s","nickName":"%s","isWL":"%s","isGN":"%s","rssi":"%s","iface":"%s","curTx":"%s","curRx":"%s","wlConnectTime":"%s"}' \
+				printf '{"mac":"%s","ip":"%s","name":"%s","nickName":"%s","isWL":"%s","isGN":"%s","rssi":"%s","iface":"%s","ssid":"%s","curTx":"%s","curRx":"%s","wlConnectTime":"%s"}' \
 					"$JMAC" \
 					"$JIP" \
 					"$JNAME" \
@@ -2079,6 +2109,7 @@ NetworkMap_Generate_JSON()
 					"$GUEST_INDEX" \
 					"$RSSI" \
 					"$JIFACE" \
+					"$JSSID" \
 					"$JCURTX" \
 					"$JCURRX" \
 					"$JWLCONNECTTIME" >> "$TMPJSON"
